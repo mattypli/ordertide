@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .env
 .vscode/
+infra/env/.env.docker
+infra/compose/.env
+info.txt
+tools/
+tree.txt
+tree_archive.txt
