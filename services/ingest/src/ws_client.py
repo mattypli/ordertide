@@ -10,7 +10,11 @@ from decimal import Decimal
 
 class WebsocketManager: 
     def __init__(self, db_pool):
-        self.queue = asyncio.Queue() # create an asynchronous FIFO queue for messages 
+        self.typed_queues = { # dictionary of queues for messages from different channels (one websocket) 
+            "trades": asyncio.Queue(),  # queue for trades messages 
+            "l2book": asyncio.Queue() # queue for l2book messages
+        }
+        self.raw_queue = asyncio.Queue() # create a queue for raw batches 
         self.stop_event = asyncio.Event() # event to signal when to stop the websocket listener and queue reader / atttributes set() and clear(), initially clear() meaning not set
         self.db_pool = db_pool # connection pool for the databases, established in main and passed to the WebsocketManager instance as a parameter 
     
@@ -68,7 +72,22 @@ class WebsocketManager:
                         if recv_task in done:
                             print("\nmessage received from websocket")
                             message = recv_task.result() # get the message from the completed recv task
-                            await self.queue.put(message) # put the message in the queue for the reader
+
+                            # check what channel the message is for 
+                            try: 
+                                payload = json.loads(message)
+                            except json.JSONDecodeError as e: 
+                                print(f"error decoding message: {e}")
+                                continue
+
+                            channel = payload.get("channel") 
+
+                            # always add to raw queue 
+                            await self.raw_queue.put((channel, message)) 
+
+                            # if channel is recognized 
+                            if channel in self.typed_queues: 
+                                await self.typed_queues[channel].put(payload) # put message in the coresponding queue for the channel (one websocket, different channels)
             
             except websockets.exceptions.ConnectionClosed as e:
                 if not self.stop_event.is_set(): # connection closed, not because we wanted to stop 
@@ -79,9 +98,46 @@ class WebsocketManager:
                     print(f"error in websocket connection: {e}")
                     await asyncio.sleep(5) # wait before trying to reconnect
 
-    # consumer of the queue // processes messages and writes to database
-    async def queue_reader(self):
+    # type raw payload entries into the ws_raw table in the database 
+    async def raw_writer(self):
+        queue = self.raw_queue # get the queue for the trades channel
+        batch = [] 
+        BATCH_SIZE = 100 # number of messages to process in a batch before writing to the database
+
+        insert_query = """
+            INSERT INTO public.ws_raw
+                (channel, payload)
+            VALUES ($1, $2::jsonb); 
+        """
+
+        while not self.stop_event.is_set() or not queue.empty():
+            try:
+                channel, message = await asyncio.wait_for(queue.get(), timeout=1.0) # wait for a message from the queue with a TimeoutError trigger 
+
+                batch.append((channel, message)) # add the raw message to the batch list
+
+                queue.task_done() # mark the message as processed in the queue
+
+                # if batch size reached, write to the database and clear the batch list 
+                if len(batch) >= BATCH_SIZE:
+                    await self.db_pool.executemany(insert_query, batch)
+                    print(f"inserted batch of {len(batch)} entries into the ws_raw database")
+                    batch.clear() # clear the batch list after writing to the database to avoid duplicate entries 
+
+            except asyncio.TimeoutError:
+                # not an error, it means that no message came in in last 1 second 
+                if len(batch) > 0: # if messages are in batch but no new messages coming in in the last second, write to the database to avoid waiting too long 
+                    await self.db_pool.executemany(insert_query, batch)
+                    print(f"inserted batch of {len(batch)} entries into the ws_raw database (timeout)")
+                    batch.clear() # clear the batch list after writing to the database to avoid duplicate entries
+                continue 
+            
+            except Exception as e:
+                print(f"error in raw queue writer: {e}")
+
+    async def trades_writer(self):
         # analysing data from the queue and processing it until either stop event is set or queue is empty 
+        queue = self.typed_queues["trades"] # get the queue for the trades channel
         batch = [] 
         BATCH_SIZE = 100 # number of messages to process in a batch before writing to the database
 
@@ -92,10 +148,9 @@ class WebsocketManager:
             ON CONFLICT (time, coin, tid) DO NOTHING; 
         """
 
-        while not self.stop_event.is_set() or not self.queue.empty():
+        while not self.stop_event.is_set() or not queue.empty():
             try:
-                message = await asyncio.wait_for(self.queue.get(), timeout=1.0) # wait for a message from the queue with a TimeoutError trigger 
-                payload = json.loads(message)
+                payload = await asyncio.wait_for(queue.get(), timeout=1.0) # wait for a message from the queue with a TimeoutError trigger 
 
                 # insert data into the batch list 
                 if "data" in payload:
@@ -113,7 +168,7 @@ class WebsocketManager:
                         )
                         batch.append(row)              
 
-                self.queue.task_done() # mark the message as processed in the queue
+                queue.task_done() # mark the message as processed in the queue
 
                 # if batch size reached, write to the database and clear the batch list 
                 if len(batch) >= BATCH_SIZE:
@@ -132,6 +187,10 @@ class WebsocketManager:
             except Exception as e:
                 print(f"error in queue reader: {e}")
 
+    async def l2book_writer(self): 
+        
+        pass 
+
     async def stop(self):
         print("stopping websocket manager and unsubscribing from all coins...")
         self.stop_event.set() # signal to stop the websocket listener and queue reader
@@ -139,7 +198,8 @@ class WebsocketManager:
     async def run(self):# run both producer and consumer concurrently
         await asyncio.gather( 
             self.websocket_listener(),
-            self.queue_reader() 
+            self.raw_writer(),
+            self.trades_writer(),
         )
 
 async def main(): 
