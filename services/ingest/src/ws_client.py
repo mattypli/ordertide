@@ -12,7 +12,7 @@ class WebsocketManager:
     def __init__(self, db_pool):
         self.typed_queues = { # dictionary of queues for messages from different channels (one websocket) 
             "trades": asyncio.Queue(),  # queue for trades messages 
-            "l2book": asyncio.Queue() # queue for l2book messages
+            "bbo": asyncio.Queue() # queue for bbo messages 
         }
         self.raw_queue = asyncio.Queue() # create a queue for raw batches 
         self.stop_event = asyncio.Event() # event to signal when to stop the websocket listener and queue reader / atttributes set() and clear(), initially clear() meaning not set
@@ -22,15 +22,13 @@ class WebsocketManager:
     async def unsubscribe_all(self, ws): # self - websocket manager, ws - websocket
         #unsubscribes all coin pairs 
         for coin in config.COINS: 
-            unsubscribe_message = {
-                "method": "unsubscribe",
-                "subscription": {
-                    "type": "trades",
-                    "coin": coin
+            for sub_type in ("trades", "bbo"):
+                unsubscribe_message = {
+                    "method": "unsubscribe",
+                    "subscription": {"type": sub_type, "coin": coin}
                 }
-            }
-            await ws.send(json.dumps(unsubscribe_message))
-        
+                await ws.send(json.dumps(unsubscribe_message))
+
         await asyncio.sleep(1) # wait for the unsubscription to be processed
         print("unsubscribed from all coins")
     
@@ -43,14 +41,22 @@ class WebsocketManager:
                 async with websockets.connect(config.WS_URL) as ws: 
                     # subscribe to the trades for the coins we care about
                     print(f"connected to websocket. listening to coins: {config.COINS}")
+                    # subscribe to trades websocket channel for each coin in the config list of coins COINS 
                     for coin in config.COINS: 
                         subscribe_message = {
                             "method" : "subscribe",
-                            "subscription" : {"type": "trades",
-                                            "coin": coin} 
+                            "subscription" : {"type": "trades","coin": coin} 
                         }
                         await ws.send(json.dumps(subscribe_message)) 
                     
+                    # subscribe to bbo websocket channel for each coin in the config list of coins COINS 
+                    for coin in config.COINS: 
+                        subscribe_message = {
+                            "method" : "subscribe",
+                            "subscription" : {"type": "bbo","coin": coin} 
+                        }
+                        await ws.send(json.dumps(subscribe_message))
+
                     print("waiting for data...") 
 
                     while not self.stop_event.is_set():
@@ -187,9 +193,59 @@ class WebsocketManager:
             except Exception as e:
                 print(f"error in queue reader: {e}")
 
-    async def l2book_writer(self): 
-        
-        pass 
+    async def bbo_writer(self): 
+        queue = self.typed_queues["bbo"] # get the queue for the trades channel
+        batch = [] 
+        BATCH_SIZE = 100 # number of messages to process in a batch before writing to the database
+
+        insert_query = """
+            INSERT INTO public.bbo
+                (coin, time, bid_px, bid_sz, bid_n, ask_px, ask_sz, ask_n)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
+            ON CONFLICT (time, coin) DO NOTHING;
+        """
+
+        while not self.stop_event.is_set() or not queue.empty():
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=1.0) # wait for a message from the queue with a TimeoutError trigger 
+
+                # insert data into the batch list 
+                if "data" in payload:
+                    data = payload["data"]
+                    coin = data["coin"]
+                    time_ms = int(data["time"])
+                    bid, ask = data["bbo"]
+
+                    row = (
+                        coin, 
+                        time_ms, 
+                        Decimal(bid["px"]) if bid else None, 
+                        Decimal(bid["sz"]) if bid else None,
+                        int(bid["n"]) if bid else None,
+                        Decimal(ask["px"]) if ask else None,
+                        Decimal(ask["sz"]) if ask else None,
+                        int(ask["n"]) if ask else None
+                    )
+                    batch.append(row)              
+
+                queue.task_done() # mark the message as processed in the queue
+
+                # if batch size reached, write to the database and clear the batch list 
+                if len(batch) >= BATCH_SIZE:
+                    await self.db_pool.executemany(insert_query, batch)
+                    print(f"inserted batch of {len(batch)} bbo entries into the database")
+                    batch.clear() # clear the batch list after writing to the database to avoid duplicate entries 
+
+            except asyncio.TimeoutError:
+                # not an error, it means that no message came in in last 1 second 
+                if len(batch) > 0: # if messages are in batch but no new messages coming in in the last second, write to the database to avoid waiting too long 
+                    await self.db_pool.executemany(insert_query, batch)
+                    print(f"inserted batch of {len(batch)} bbo entries into the database (timeout)")
+                    batch.clear() # clear the batch list after writing to the database to avoid duplicate entries
+                continue 
+            
+            except Exception as e:
+                print(f"error in queue reader: {e}")           
 
     async def stop(self):
         print("stopping websocket manager and unsubscribing from all coins...")
@@ -200,6 +256,7 @@ class WebsocketManager:
             self.websocket_listener(),
             self.raw_writer(),
             self.trades_writer(),
+            self.bbo_writer()
         )
 
 async def main(): 
